@@ -1,20 +1,23 @@
-# ClaudeCode Changelog Notify
+# CLI Release Notify
 
-Cloudflare Worker that monitors the Claude Code changelog every 15 minutes and sends notifications to Telegram, Discord, and/or Slack when new updates are detected.
+Cloudflare Worker that monitors release updates for Claude Code, Codex, and Gemini CLI every 15 minutes and sends notifications to Telegram, Discord, and/or Slack when new updates are detected.
 
 ## Features
 
 - Scheduled checks every 15 minutes using Cloudflare Workers Cron Triggers
-- Automatic changelog diffing to detect only new updates
+- Tracks Claude Code via the upstream changelog
+- Tracks Codex and Gemini CLI via stable GitHub releases only
+- Automatic diffing to detect only new updates
 - Multi-platform notifications (Telegram, Discord, Slack) - configure one or all
-- Stores last seen version in Cloudflare KV to avoid duplicate notifications
+- Stores per-product last seen versions in Cloudflare KV to avoid duplicate notifications
+- One-time lazy migration from the legacy Claude-only KV key
 
 ## Setup
 
 ### 1. Create KV Namespace
 
 ```bash
-wrangler kv namespace create claudecode-changelog-notify-kv
+wrangler kv namespace create claudecode-codex-gemini-changelog-notify-kv
 ```
 
 Copy the `id` from the output and update `wrangler.jsonc`:
@@ -52,7 +55,15 @@ wrangler secret put DISCORD_WEBHOOK_URL
 wrangler secret put SLACK_WEBHOOK_URL
 ```
 
-### 3. Deploy
+### 3. Optional GitHub API Token
+
+Codex and Gemini CLI releases are fetched from the GitHub Releases API. The worker works without authentication, but adding a token gives you higher rate limits.
+
+```bash
+wrangler secret put GITHUB_TOKEN
+```
+
+### 4. Deploy
 
 ```bash
 npm run deploy
@@ -62,6 +73,12 @@ npm run deploy
 
 ```bash
 npm run dev
+```
+
+Run the unit tests:
+
+```bash
+npm test
 ```
 
 Test the scheduled handler:
@@ -78,10 +95,11 @@ curl "http://localhost:8787/check"
 
 ## How It Works
 
-1. Every 15 minutes, the worker fetches the Claude Code changelog
-2. Parses the markdown to extract version entries
-3. Compares with the last seen version stored in KV
-4. If new versions are found, sends notifications to all configured platforms
-5. Updates the last seen version in KV
+1. Every 15 minutes, the worker checks Claude Code, Codex, and Gemini CLI in a fixed order
+2. Claude Code is parsed from the upstream changelog markdown
+3. Codex and Gemini CLI are read from stable GitHub releases only
+4. Each product is compared with its own last seen version stored in KV
+5. New releases are sent as separate messages to all configured platforms
+6. Each product checkpoint is updated only if its notifications succeeded
 
-On first run, it stores the current latest version without sending notifications.
+On first run for any product, the worker stores the current latest version without sending notifications.

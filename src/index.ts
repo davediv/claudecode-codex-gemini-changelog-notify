@@ -1,10 +1,16 @@
-const CHANGELOG_URL =
+const CLAUDE_CHANGELOG_URL =
 	'https://raw.githubusercontent.com/anthropics/claude-code/refs/heads/main/CHANGELOG.md';
-const KV_KEY = 'last_seen_version';
+const LEGACY_KV_KEY = 'last_seen_version';
+const KV_KEY_PREFIX = 'last_seen_version:';
+const GITHUB_RELEASES_PER_PAGE = 100;
+const GITHUB_API_BASE_URL = 'https://api.github.com';
+const GITHUB_USER_AGENT = 'claudecode-codex-gemini-changelog-notify';
 
 const MAX_TELEGRAM_LENGTH = 4096;
 const MAX_DISCORD_LENGTH = 2000;
 const MAX_SLACK_LENGTH = 40000;
+
+export type ProductId = 'claude-code' | 'codex' | 'gemini-cli';
 
 interface Env {
 	KV: KVNamespace;
@@ -13,9 +19,10 @@ interface Env {
 	TELEGRAM_THREAD_ID?: string;
 	DISCORD_WEBHOOK_URL?: string;
 	SLACK_WEBHOOK_URL?: string;
+	GITHUB_TOKEN?: string;
 }
 
-interface VersionEntry {
+export interface VersionEntry {
 	version: string;
 	content: string;
 }
@@ -24,6 +31,56 @@ interface NotificationResult {
 	platform: string;
 	success: boolean;
 }
+
+export interface ProductDefinition {
+	id: ProductId;
+	label: string;
+	source: 'changelog' | 'github-releases';
+	changelogUrl?: string;
+	githubRepo?: string;
+}
+
+interface GitHubRelease {
+	tag_name: string;
+	body: string | null;
+	draft: boolean;
+	prerelease: boolean;
+}
+
+type Logger = Pick<Console, 'log' | 'warn' | 'error'>;
+type FetchFn = typeof fetch;
+type NotificationSender = (message: string, env: Env) => Promise<boolean>;
+
+export interface CheckDependencies {
+	fetchFn?: FetchFn;
+	sendNotificationsFn?: NotificationSender;
+	logger?: Logger;
+}
+
+export const PRODUCTS: readonly ProductDefinition[] = [
+	{
+		id: 'claude-code',
+		label: 'Claude Code',
+		source: 'changelog',
+		changelogUrl: CLAUDE_CHANGELOG_URL,
+	},
+	{
+		id: 'codex',
+		label: 'Codex',
+		source: 'github-releases',
+		githubRepo: 'openai/codex',
+	},
+	{
+		id: 'gemini-cli',
+		label: 'Gemini CLI',
+		source: 'github-releases',
+		githubRepo: 'google-gemini/gemini-cli',
+	},
+] as const;
+
+export const PRODUCTS_BY_ID = Object.fromEntries(
+	PRODUCTS.map((product) => [product.id, product])
+) as Record<ProductId, ProductDefinition>;
 
 // Truncate message to max length with ellipsis
 function truncateMessage(message: string, maxLength: number): string {
@@ -38,8 +95,16 @@ function escapeTelegramMarkdown(text: string): string {
 	return text.replace(/([_*`\[])/g, '\\$1');
 }
 
+export function getKvKey(productId: ProductId): string {
+	return `${KV_KEY_PREFIX}${productId}`;
+}
+
+export function normalizeDisplayVersion(version: string): string {
+	return version.replace(/^v/i, '');
+}
+
 // Parse changelog markdown into version entries
-function parseChangelog(markdown: string): VersionEntry[] {
+export function parseChangelog(markdown: string): VersionEntry[] {
 	const entries: VersionEntry[] = [];
 	const lines = markdown.split('\n');
 
@@ -73,13 +138,24 @@ function parseChangelog(markdown: string): VersionEntry[] {
 	return entries;
 }
 
-// Get new versions since the last seen version
-function getNewVersions(entries: VersionEntry[], lastSeenVersion: string): VersionEntry[] {
-	const lastSeenIndex = entries.findIndex((e) => e.version === lastSeenVersion);
+export function filterStableReleases(releases: GitHubRelease[]): GitHubRelease[] {
+	return releases.filter((release) => !release.draft && !release.prerelease);
+}
 
-	// If last seen version not found in changelog, treat as first run to avoid spam
+// Get new versions since the last seen version
+export function getNewVersions(
+	entries: VersionEntry[],
+	lastSeenVersion: string,
+	logger: Logger = console,
+	productLabel = 'product'
+): VersionEntry[] {
+	const lastSeenIndex = entries.findIndex((entry) => entry.version === lastSeenVersion);
+
+	// If last seen version not found in the source, treat as first run to avoid spam.
 	if (lastSeenIndex === -1) {
-		console.warn(`Last seen version ${lastSeenVersion} not found in changelog, treating as first run`);
+		logger.warn(
+			`Last seen version ${lastSeenVersion} not found for ${productLabel}, treating as first run`
+		);
 		return [];
 	}
 
@@ -87,8 +163,9 @@ function getNewVersions(entries: VersionEntry[], lastSeenVersion: string): Versi
 }
 
 // Format version entry for notification
-function formatVersionMessage(entry: VersionEntry): string {
-	return `📦 Claude Code v${entry.version}\n\n${entry.content}`;
+export function formatVersionMessage(productLabel: string, entry: VersionEntry): string {
+	const header = `📦 ${productLabel} v${normalizeDisplayVersion(entry.version)}`;
+	return entry.content ? `${header}\n\n${entry.content}` : header;
 }
 
 // Send notification to Telegram
@@ -160,7 +237,11 @@ async function sendSlack(message: string, webhookUrl: string): Promise<Notificat
 }
 
 // Send notifications to all configured platforms
-async function sendNotifications(message: string, env: Env): Promise<boolean> {
+async function sendNotifications(
+	message: string,
+	env: Env,
+	logger: Logger = console
+): Promise<boolean> {
 	const promises: Promise<NotificationResult>[] = [];
 
 	if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
@@ -178,77 +259,193 @@ async function sendNotifications(message: string, env: Env): Promise<boolean> {
 	}
 
 	if (promises.length === 0) {
-		console.warn('No notification platforms configured');
+		logger.warn('No notification platforms configured');
 		return false;
 	}
 
 	const results = await Promise.all(promises);
-	const successCount = results.filter((r) => r.success).length;
-	const failedPlatforms = results.filter((r) => !r.success).map((r) => r.platform);
+	const successCount = results.filter((result) => result.success).length;
+	const failedPlatforms = results.filter((result) => !result.success).map((result) => result.platform);
 
 	if (failedPlatforms.length > 0) {
-		console.error(`Failed to send to: ${failedPlatforms.join(', ')}`);
+		logger.error(`Failed to send to: ${failedPlatforms.join(', ')}`);
 	}
 
 	// Return true if at least one platform succeeded
 	return successCount > 0;
 }
 
-// Check for changelog updates and send notifications
-async function checkChangelog(env: Env): Promise<void> {
-	const response = await fetch(CHANGELOG_URL);
+async function fetchClaudeEntries(
+	product: ProductDefinition,
+	fetchFn: FetchFn,
+	logger: Logger
+): Promise<VersionEntry[]> {
+	const response = await fetchFn(product.changelogUrl!);
 	if (!response.ok) {
-		console.error(`Failed to fetch changelog: ${response.status}`);
-		return;
+		throw new Error(`Failed to fetch changelog: ${response.status}`);
 	}
 
 	const markdown = await response.text();
 	const entries = parseChangelog(markdown);
 
 	if (entries.length === 0) {
-		console.log('No version entries found in changelog');
+		logger.log(`No version entries found for ${product.label}`);
+	}
+
+	return entries;
+}
+
+async function fetchGitHubEntries(
+	product: ProductDefinition,
+	env: Env,
+	fetchFn: FetchFn
+): Promise<VersionEntry[]> {
+	const releases: VersionEntry[] = [];
+
+	for (let page = 1; ; page += 1) {
+		const url = new URL(`${GITHUB_API_BASE_URL}/repos/${product.githubRepo!}/releases`);
+		url.searchParams.set('page', page.toString());
+		url.searchParams.set('per_page', GITHUB_RELEASES_PER_PAGE.toString());
+
+		const headers: HeadersInit = {
+			Accept: 'application/vnd.github+json',
+			'User-Agent': GITHUB_USER_AGENT,
+		};
+
+		if (env.GITHUB_TOKEN) {
+			headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
+		}
+
+		const response = await fetchFn(url.toString(), { headers });
+		if (!response.ok) {
+			throw new Error(`Failed to fetch GitHub releases for ${product.githubRepo}: ${response.status}`);
+		}
+
+		const pageReleases = (await response.json()) as GitHubRelease[];
+		if (!Array.isArray(pageReleases)) {
+			throw new Error(`Unexpected GitHub response for ${product.githubRepo}`);
+		}
+
+		const stableEntries = filterStableReleases(pageReleases).map((release) => ({
+			version: release.tag_name,
+			content: release.body?.trim() ?? '',
+		}));
+		releases.push(...stableEntries);
+
+		if (pageReleases.length < GITHUB_RELEASES_PER_PAGE) {
+			break;
+		}
+	}
+
+	return releases;
+}
+
+async function fetchEntriesForProduct(
+	product: ProductDefinition,
+	env: Env,
+	fetchFn: FetchFn,
+	logger: Logger
+): Promise<VersionEntry[]> {
+	if (product.source === 'changelog') {
+		return fetchClaudeEntries(product, fetchFn, logger);
+	}
+
+	return fetchGitHubEntries(product, env, fetchFn);
+}
+
+export async function migrateLegacyClaudeCheckpoint(
+	env: Env,
+	logger: Logger = console
+): Promise<void> {
+	const claudeKey = getKvKey('claude-code');
+	const currentClaudeCheckpoint = await env.KV.get(claudeKey);
+
+	if (currentClaudeCheckpoint) {
+		return;
+	}
+
+	const legacyCheckpoint = await env.KV.get(LEGACY_KV_KEY);
+	if (!legacyCheckpoint) {
+		return;
+	}
+
+	await env.KV.put(claudeKey, legacyCheckpoint);
+	logger.log(`Migrated legacy Claude Code checkpoint to ${claudeKey}`);
+}
+
+export async function processProduct(
+	product: ProductDefinition,
+	env: Env,
+	dependencies: CheckDependencies = {}
+): Promise<void> {
+	const logger = dependencies.logger ?? console;
+	const fetchFn = dependencies.fetchFn ?? fetch;
+	const notificationSender =
+		dependencies.sendNotificationsFn ??
+		((message: string, runtimeEnv: Env) => sendNotifications(message, runtimeEnv, logger));
+
+	const entries = await fetchEntriesForProduct(product, env, fetchFn, logger);
+	if (entries.length === 0) {
 		return;
 	}
 
 	const latestVersion = entries[0].version;
-	const lastSeenVersion = await env.KV.get(KV_KEY);
+	const kvKey = getKvKey(product.id);
+	const lastSeenVersion = await env.KV.get(kvKey);
 
 	if (!lastSeenVersion) {
-		console.log(`First run - storing latest version: ${latestVersion}`);
-		await env.KV.put(KV_KEY, latestVersion);
+		logger.log(`First run for ${product.label} - storing latest version: ${latestVersion}`);
+		await env.KV.put(kvKey, latestVersion);
 		return;
 	}
 
 	if (latestVersion === lastSeenVersion) {
-		console.log(`No new updates. Current version: ${latestVersion}`);
+		logger.log(`No new updates for ${product.label}. Current version: ${latestVersion}`);
 		return;
 	}
 
-	const newVersions = getNewVersions(entries, lastSeenVersion);
+	const newVersions = getNewVersions(entries, lastSeenVersion, logger, product.label);
 
 	if (newVersions.length === 0) {
-		console.log('No new versions to notify');
-		await env.KV.put(KV_KEY, latestVersion);
+		logger.log(`No new versions to notify for ${product.label}`);
+		await env.KV.put(kvKey, latestVersion);
 		return;
 	}
 
-	console.log(`Found ${newVersions.length} new version(s)`);
+	logger.log(`Found ${newVersions.length} new version(s) for ${product.label}`);
 
-	// Send notifications for each new version (oldest first)
 	let allSucceeded = true;
 	for (const entry of [...newVersions].reverse()) {
-		const message = formatVersionMessage(entry);
-		const success = await sendNotifications(message, env);
+		const message = formatVersionMessage(product.label, entry);
+		const success = await notificationSender(message, env);
 		if (!success) {
 			allSucceeded = false;
 		}
 	}
 
 	if (allSucceeded) {
-		await env.KV.put(KV_KEY, latestVersion);
-		console.log(`Updated last seen version to: ${latestVersion}`);
+		await env.KV.put(kvKey, latestVersion);
+		logger.log(`Updated ${product.label} last seen version to: ${latestVersion}`);
 	} else {
-		console.error('Some notifications failed, not updating last seen version');
+		logger.error(`Some ${product.label} notifications failed, not updating last seen version`);
+	}
+}
+
+export async function checkForUpdates(
+	env: Env,
+	dependencies: CheckDependencies = {}
+): Promise<void> {
+	const logger = dependencies.logger ?? console;
+
+	await migrateLegacyClaudeCheckpoint(env, logger);
+
+	for (const product of PRODUCTS) {
+		try {
+			await processProduct(product, env, { ...dependencies, logger });
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			logger.error(`Failed to process ${product.label}: ${message}`);
+		}
 	}
 }
 
@@ -257,19 +454,19 @@ export default {
 		const url = new URL(req.url);
 
 		if (url.pathname === '/check') {
-			await checkChangelog(env);
-			return new Response('Changelog check completed');
+			await checkForUpdates(env);
+			return new Response('Release check completed');
 		}
 
 		url.pathname = '/__scheduled';
 		url.searchParams.set('cron', '*/15 * * * *');
 		return new Response(
-			`Claude Code Changelog Monitor\n\nTo test the scheduled handler, run:\ncurl "${url.href}"\n\nOr trigger a manual check:\ncurl "${new URL('/check', req.url).href}"`
+			`CLI Release Monitor\n\nTracking: Claude Code, Codex, Gemini CLI\n\nTo test the scheduled handler, run:\ncurl "${url.href}"\n\nOr trigger a manual check:\ncurl "${new URL('/check', req.url).href}"`
 		);
 	},
 
 	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
 		console.log(`Scheduled trigger fired at ${event.cron}`);
-		ctx.waitUntil(checkChangelog(env));
+		ctx.waitUntil(checkForUpdates(env));
 	},
 } satisfies ExportedHandler<Env>;
